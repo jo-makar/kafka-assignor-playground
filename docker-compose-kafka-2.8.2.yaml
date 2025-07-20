@@ -1,0 +1,151 @@
+services:
+  zookeeper:
+    hostname: zookeeper
+    image: kafka-assignor-playground/zookeeper:2.8.2
+    build:
+      dockerfile_inline: &dockerfile |
+        FROM ubuntu:24.04
+        ARG URL=https://archive.apache.org/dist/kafka/2.8.2/kafka_2.13-2.8.2.tgz
+        RUN apt update && apt install -y curl net-tools openjdk-11-jre
+        RUN curl -O $$URL
+        RUN file=$${URL##*/} dir=$${file%.*}; tar xf $$file && mv $$dir kafka
+        WORKDIR /kafka
+        CMD bin/zookeeper-server-start.sh config/zookeeper.properties
+    ports:
+      - 127.0.0.1:2181:2181/tcp
+    healthcheck:
+      test: netstat -lt | grep -q :2181
+      interval: 1s
+  broker0:
+    hostname: broker0
+    image: kafka-assignor-playground/kafka:2.8.2
+    build:
+      dockerfile_inline: |
+        FROM kafka-assignor-playground/zookeeper:2.8.2
+        COPY <<EOF bin/broker-config
+        #!/bin/sh
+        mv config/server.properties config/server.properties.bak
+        awk '/^broker.id=/         { print "broker.id=" '\$$BROKER_ID'; next }
+             /^zookeeper.connect=/ { print "zookeeper.connect=zookeeper:2181"; next }
+                                   { print }
+             END                   { print "listeners=PLAINTEXT://broker"'\$$BROKER_ID'":9092" }
+            ' config/server.properties.bak >config/server.properties
+        EOF
+        RUN chmod +x bin/broker-config
+        CMD bin/broker-config && bin/kafka-server-start.sh config/server.properties
+    environment:
+      BROKER_ID: 0
+    ports:
+      - 127.0.0.1:9092:9092/tcp
+    depends_on: &broker-depends-on
+      zookeeper:
+        condition: service_healthy
+    healthcheck: &broker-healthcheck
+      test: netstat -lt | grep -q :9092
+      interval: 5s
+  broker1:
+    hostname: broker1
+    image: kafka-assignor-playground/kafka:2.8.2
+    environment:
+      BROKER_ID: 1
+    ports:
+      - 127.0.0.1:19092:9092/tcp
+    depends_on: *broker-depends-on
+    healthcheck: *broker-healthcheck
+  broker2:
+    hostname: broker2
+    image: kafka-assignor-playground/kafka:2.8.2
+    environment:
+      BROKER_ID: 2
+    ports:
+      - 127.0.0.1:29092:9092/tcp
+    depends_on: *broker-depends-on
+    healthcheck: *broker-healthcheck
+  topic-setup:
+    image: kafka-assignor-playground/zookeeper:2.8.2
+    command: >
+      sh -c 'bin/kafka-topics.sh --bootstrap-server broker0:9092,broker1:9092,broker2:9092 \
+               --create --topic $$TOPIC --partitions $$PARTITIONS --replication-factor 1'
+    environment: &topic-setup-environment
+      TOPIC: topic0
+      # NB The number of consumer threads (sum of consumer?.environment.num_threads)
+      # should greater than or equal to the number of topic partitions being processed
+      PARTITIONS: 40
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+      broker0:
+        condition: service_healthy
+      broker1:
+        condition: service_healthy
+      broker2:
+        condition: service_healthy
+  producer:
+    image: kafka-assignor-playground/producer:2.8.2
+    build:
+      dockerfile_inline: |
+        FROM kafka-assignor-playground/zookeeper:2.8.2
+        COPY <<EOF bin/payload-file
+        #!/usr/bin/env python3
+        import random
+        import sys
+        path = sys.argv[1]
+        lines, min_cpu_ms, max_cpu_ms = [int(arg) for arg in sys.argv[2:]]
+        with open(path, 'w') as file:
+            for _ in range(lines):
+                file.write(f'{{"cpu_ms":{random.randint(min_cpu_ms, max_cpu_ms)}}}\\n')
+        EOF
+        RUN chmod +x bin/payload-file
+        CMD bin/payload-file /tmp/$$TOPIC-payload.cjson $$LINES $$CPU_MS_MIN $$CPU_MS_MAX && \
+            bin/kafka-producer-perf-test.sh \
+              --producer-props bootstrap.servers=broker0:9092,broker1:9092,broker2:9092 \
+              --topic $$TOPIC --payload-file /tmp/$$TOPIC-payload.cjson \
+              --num-records $$RECORDS --throughput $$THROUGHPUT --print-metrics
+    environment:
+      <<: *topic-setup-environment
+      LINES: 1000
+      RECORDS: 20000
+      CPU_MS_MIN: 100
+      CPU_MS_MAX: 200
+      THROUGHPUT: 100
+    depends_on:
+      consumer0:
+        condition: service_healthy
+      consumer1:
+        condition: service_healthy
+  consumer0:
+    hostname: consumer0
+    image: kafka-assignor-playground/consumer:2.8.2
+    build:
+      context: assignors
+      dockerfile_inline: |
+        FROM ubuntu:24.04
+        RUN apt update && apt install -y openjdk-21-jdk
+        COPY . /assignors
+        WORKDIR /assignors
+        RUN ./gradlew build
+        # TODO Preferrably unpack build/distributions/assignors.tar and run bin/assignors
+        #      Investigate why logging.properties isn't being applied when doing this
+        CMD ./gradlew run
+    environment: &consumer-environment
+      num_threads: 20 # Processing is simulated, this value can be set arbitrarily
+      partition_assignment_strategy: ${partition_assignment_strategy:-org.example.CooperativeLagTimePartitionAssignor}
+    depends_on: &consumer-depends-on
+      topic-setup:
+        condition: service_completed_successfully
+    healthcheck: &consumer-healthcheck
+      test: jps | grep -q App
+      interval: 1s
+      start_period: 10s
+  consumer1:
+    hostname: consumer1
+    image: kafka-assignor-playground/consumer:2.8.2
+    environment: *consumer-environment
+    depends_on: *consumer-depends-on
+    healthcheck: *consumer-healthcheck
+  consumer2:
+    hostname: consumer2
+    image: kafka-assignor-playground/consumer:2.8.2
+    environment: *consumer-environment
+    depends_on: *consumer-depends-on
+    healthcheck: *consumer-healthcheck
