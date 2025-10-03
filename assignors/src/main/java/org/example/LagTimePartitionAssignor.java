@@ -13,6 +13,7 @@ import java.util.concurrent.ThreadLocalRandom;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 import java.util.Map;
 import java.util.Set;
@@ -50,7 +51,7 @@ public class LagTimePartitionAssignor implements ConsumerPartitionAssignor {
     private static final int PARTITION_NON_LAGGED_PCT = 15;
     private static final float PARTITION_OVERLOAD_FACTOR = 1.67f;
 
-    private static Logger logger = Logger.getLogger(LagTimePartitionAssignor.class.getName());
+    private static final Logger logger = Logger.getLogger(LagTimePartitionAssignor.class.getName());
 
     // Track the last assignment to maintain assignment stickiness
     private Map<TopicPartition,String> lastAssignmentMap = new HashMap<>();
@@ -202,8 +203,9 @@ public class LagTimePartitionAssignor implements ConsumerPartitionAssignor {
             }
 
             if (!consumerIdsWithoutUserData.isEmpty())
-                logger.warning(
-                    "Consumers without valid user data: " +
+                logger.log(
+                    Level.WARNING,
+                    "Consumers without valid user data: {0}",
                     consumerIdsWithoutUserData.toString()
                 );
 
@@ -332,7 +334,11 @@ public class LagTimePartitionAssignor implements ConsumerPartitionAssignor {
             if (!seenTopics.equals(topics)) {
                 HashSet<String> unseenTopics = new HashSet<>(topics);
                 unseenTopics.removeAll(seenTopics);
-                logger.warning("No partition lag time for topics " + unseenTopics.toString());
+                logger.log(
+                    Level.WARNING,
+                    "No partition lag time for topics {0}",
+                    unseenTopics.toString()
+                );
             }
 
             final int bufferLength = Short.BYTES +              // Version
@@ -373,7 +379,7 @@ public class LagTimePartitionAssignor implements ConsumerPartitionAssignor {
             super(partition, lagTime);
         }
 
-        public int compareTo(PartitionLagTime other) {
+        @Override public int compareTo(PartitionLagTime other) {
             return Double.compare(this.getSecond(), other.getSecond());
         }
     }
